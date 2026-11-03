@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "coderunner.proto";
+package coderunner;
+
+//ManagerServer
+service ManagerRegistration {
+  rpc register(RegisterRequest) returns (RegisterResponse); // a - Registo
+}
+
+//RunServers
+service ServerDirectory {
+  rpc getServer(Empty) returns (ServerAddress);
+  rpc locate(RequestId) returns (ServerAddress);
+}
+
+//Cliente
+service Runner {
+  rpc submit(stream SubmitChunk) returns (SubmitResponse);
+  rpc getResult(RequestId) returns (stream Result);
+}
+
+message Empty {}
+message RequestId { string id = 1; }
+message ServerAddress { string host = 1; uint32 port = 2; }
+message RegisterRequest { string host = 1; uint32 port = 2; }
+message RegisterResponse { string redisHost = 1; uint32 redisPort = 2; }
+message SubmitChunk {
+  oneof content {
+    bytes program = 1;
+    bytes stdin = 2;
+  }
+}
+message SubmitResponse { string id = 1; }
+enum RequestState { UNKNOWN = 0; PENDING = 1; RUNNING = 2; FINISHED = 3; FAILED = 4; TIMEOUT = 5; }
+message Result {
+  string id = 1;
+  RequestState state = 2;
+  bytes stdout = 3;
+  bytes stderr = 4;
+  string ownerHost = 5;
+  uint32 ownerPort = 6;
+}

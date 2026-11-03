@@ -1,0 +1,30 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: coderunner-redis
+    ports:
+      - "6379:6379"
+  manager:
+    build: .
+    command: ["-jar", "/app/manager-server.jar", "5000"]
+    environment:
+      REDIS_HOST: redis
+      REDIS_ADVERTISE_HOST: redis
+      REDIS_PORT: "6379"
+    ports:
+      - "5000:5000"
+    depends_on:
+      - redis
+  runserver:
+    build: .
+    command: ["-jar", "/app/run-server.jar", "localhost", "5001", "manager", "5000", "redis", "6379"]
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    ports:
+      - "5001:5001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - manager
+      - redis
