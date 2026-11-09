@@ -1,30 +1,79 @@
+version: '3.8'
+
 services:
   redis:
     image: redis:7-alpine
     container_name: coderunner-redis
     ports:
       - "6379:6379"
+
   manager:
     build: .
+    container_name: coderunner-manager
     command: ["-jar", "/app/manager-server.jar", "5000"]
     environment:
-      REDIS_HOST: redis
-      REDIS_ADVERTISE_HOST: redis
-      REDIS_PORT: "6379"
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     ports:
       - "5000:5000"
     depends_on:
       - redis
-  runserver:
+
+  runserver1:
     build: .
+    container_name: coderunner-runserver-1
     command: ["-jar", "/app/run-server.jar", "localhost", "5001", "manager", "5000", "redis", "6379"]
     environment:
-      REDIS_HOST: redis
-      REDIS_PORT: "6379"
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - RUNSERVER_WORK_VOLUME=coderunner-work-1
     ports:
       - "5001:5001"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - coderunner-work-1:/app/requests
     depends_on:
       - manager
       - redis
+
+  runserver2:
+    build: .
+    container_name: coderunner-runserver-2
+    command: ["-jar", "/app/run-server.jar", "localhost", "5002", "manager", "5000", "redis", "6379"]
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - RUNSERVER_WORK_VOLUME=coderunner-work-2
+    ports:
+      - "5002:5002"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - coderunner-work-2:/app/requests
+    depends_on:
+      - manager
+      - redis
+
+  runserver3:
+    build: .
+    container_name: coderunner-runserver-3
+    command: ["-jar", "/app/run-server.jar", "localhost", "5003", "manager", "5000", "redis", "6379"]
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - RUNSERVER_WORK_VOLUME=coderunner-work-3
+    ports:
+      - "5003:5003"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - coderunner-work-3:/app/requests
+    depends_on:
+      - manager
+      - redis
+
+volumes:
+  coderunner-work-1:
+    name: coderunner-work-1
+  coderunner-work-2:
+    name: coderunner-work-2
+  coderunner-work-3:
+    name: coderunner-work-3

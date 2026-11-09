@@ -18,9 +18,6 @@ CodeRunner/
 └── client/
 ```
 
-O módulo `contract` é uma biblioteca; `manager-server`, `run-server` e `client`
-são aplicações independentes que dependem dele.
-
 ## Pré-requisitos
 
 JDK 21, Gradle, Docker e Redis. O container de execução usa
@@ -29,30 +26,81 @@ JDK 21, Gradle, Docker e Redis. O container de execução usa
 ## Executar localmente
 
 ```powershell
+
 docker run --rm -d --name coderunner-redis -p 6379:6379 redis:7-alpine
-gradle :manager-server:shadowJar :run-server:shadowJar :client:shadowJar
+
+.\gradlew.bat :manager-server:shadowJar :run-server:shadowJar :client:shadowJar
+
 java -jar manager-server/build/libs/manager-server-1.0-all.jar 5000
-java -jar run-server/build/libs/run-server-1.0-all.jar 127.0.0.1 5001
-java -jar client/build/libs/client-1.0-all.jar programa.py input.txt
+
+java -jar run-server/build/libs/run-server-1.0-all.jar 127.0.0.1 5001 127.0.0.1 5000 127.0.0.1 6379
+java -jar run-server/build/libs/run-server-1.0-all.jar 127.0.0.1 5002 127.0.0.1 5000 127.0.0.1 6379
+java -jar run-server/build/libs/run-server-1.0-all.jar 127.0.0.1 5003 127.0.0.1 5000 127.0.0.1 6379
+
+java -jar client/build/libs/client-1.0-all.jar scripts/programa.py input.txt 127.0.0.1 5000
 ```
+
+## Executar no GCP após a criação e configuração das VMs (vm-run-1, vm-run-2, vm-manager) e da importação através do "Bitvise SSH Cli" dos ficheiros .jar:
+
+```powershell
+
+# Na VM do ManagerServer
+export REDIS_HOST=127.0.0.1
+export REDIS_ADVERTISE_HOST=<IP_INTERNO_VM_MNG>
+export REDIS_PORT=6379
+
+java -jar manager-server-1.0-all.jar 5000
+
+#RNSV1
+java -jar run-server-1.0-all.jar <IP_EXT_RUNSV1> 5001 <IP_INTERNO_VM_MNG> 5000 <IP_INTERNO_VM_MNG> 6379
+
+
+#CLI
+
+java -jar client-1.0-all.jar scripts/programa.py input.txt <IP_EXT_VM_MNG> 5000
+
+ou a correr o cliente localmente:
+
+java -jar client\build\libs\client-1.0-all.jar scripts/programa.py input.txt <IP_EXT_VM_MNG> 5000
+```
+
+
+
+Os três processos devem ser iniciados em terminais separados, pela ordem
+Redis, ManagerServer, RunServer e Client. O `RunServer` exige pelo menos
+`host` e `port`; o `Client` exige o caminho do programa Python. O Docker
+Desktop tem de estar iniciado antes de executar o Redis ou os pedidos.
 
 O comando `Client` imprime o identificador, acompanha o estado e escreve stdout
 e stderr nos canais correspondentes. Para várias instâncias, iniciar cada
 RunServer numa porta diferente e registar todas no mesmo ManagerServer.
 
-O `RunServer` executa os containers sem privilégios de root. Em Linux, configure
-`RUNNER_UID` e `RUNNER_GID` com o UID/GID do utilizador que deve ser dono dos
-ficheiros montados (por omissão são usados `1000:1000`). Em instalações com
-Redis noutra VM, configure no ManagerServer `REDIS_HOST` para a ligação local
-e `REDIS_ADVERTISE_HOST` para o hostname/IP que os RunServers conseguem
-alcançar.
+O `RunServer` lança e monitoriza os containers através da biblioteca
+`docker-java`, seguindo o exemplo em `Trabs/TP1/3-docker-java-examples`.
+Em Linux, o container é executado com o UID/GID atual quando disponível. Em
+instalações com Redis noutra VM, configure no ManagerServer `REDIS_HOST` para
+a ligação local e `REDIS_ADVERTISE_HOST` para o hostname/IP que os RunServers
+conseguem alcançar.
 
 Todos os componentes escrevem logs de diagnóstico para a consola. Os logs
 incluem timestamp, IP/porto, método gRPC, identificador do pedido, estado,
 tamanho dos dados, operações Redis e ciclo de vida do container, sem imprimir
 o conteúdo dos programas ou dos ficheiros de input.
 
-Para observar as portas em utilização no Windows:
+Com Redis em Docker, estes comandos mostram o estado dos pedidos:
+
+```powershell
+docker exec coderunner-redis redis-cli KEYS "coderunner:request:*"
+docker exec coderunner-redis redis-cli HGETALL coderunner:request:<id>
+```
+E para acompanhar todas as operações Redis em tempo real:
+
+```powershell
+docker exec coderunner-redis redis-cli MONITOR
+```
+
+
+Outros comandos uteis para observar as portas em utilização no Windows:
 
 ```powershell
 Get-NetTCPConnection -State Listen |
@@ -67,28 +115,11 @@ Get-NetTCPConnection -LocalPort 5001,5002,6379 -ErrorAction SilentlyContinue |
     Select-Object LocalAddress,LocalPort,OwningProcess
 ```
 
-Com Redis em Docker, estes comandos mostram o estado dos pedidos:
-
-```powershell
-docker exec coderunner-redis redis-cli KEYS "coderunner:request:*"
-docker exec coderunner-redis redis-cli HGETALL coderunner:request:<id>
-```
-
-Para acompanhar todas as operações Redis em tempo real:
-
-```powershell
-docker exec coderunner-redis redis-cli MONITOR
-```
-
-`MONITOR` é muito detalhado e deve ser usado apenas durante o diagnóstico.
-
 ## Docker Compose
 
 O `docker-compose.yml` inicia Redis, ManagerServer e um RunServer. O RunServer
-recebe acesso ao socket Docker para criar containers efémeros; em produção
-deve ser usado um executor dedicado com políticas equivalentes e isolamento
-adicional.
+recebe acesso ao socket Docker para criar containers.
 
-Este é um esboço académico: autenticação, TLS, quotas por utilizador,
-limpeza periódica e persistência dos ficheiros após reinício ainda devem ser
-acrescentados antes de uma utilização real.
+```powershell
+docker compose up --build -d
+```

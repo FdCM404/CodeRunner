@@ -1,6 +1,8 @@
 package coderunner.client;
 
 import coderunner.proto.*;
+import coderunner.proto.ServiceGrpc.ServiceStub;
+import com.google.protobuf.ByteString;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.stub.StreamObserver;
@@ -10,11 +12,10 @@ import java.nio.file.Path;
 import java.io.ByteArrayOutputStream;
 import java.time.Instant;
 import java.util.Iterator;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 public final class Client {
+
     private static final String DEFAULT_MANAGER_HOST = "127.0.0.1";
     private static final int DEFAULT_MANAGER_PORT = 5000;
     private final ManagedChannel managerChannel;
@@ -35,32 +36,29 @@ public final class Client {
                 + " programBytes=" + Files.size(program)
                 + " input=" + (input == null ? "<none>" : input)
                 + " inputBytes=" + (input == null ? 0 : Files.size(input)));
+                
+        //b - Obter Servidor
         ServerAddress address = directory.getServer(Empty.getDefaultInstance());
         log("getServer response RunServer=" + address.getHost() + ":" + address.getPort());
         ManagedChannel channel = channel(address);
         try {
-            RunnerGrpc.RunnerStub runner = RunnerGrpc.newStub(channel);
-            CountDownLatch done = new CountDownLatch(1);
-            String[] id = new String[1];
-            AtomicReference<Throwable> failure = new AtomicReference<>();
-            StreamObserver<SubmitChunk> request = runner.submit(new StreamObserver<>() {
-                public void onNext(SubmitResponse response) { id[0] = response.getId(); }
-                public void onError(Throwable error) { failure.set(error); done.countDown(); }
-                public void onCompleted() { done.countDown(); }
-            });
+            // NON BLOCKING STUB
+            ServiceStub noBlockStub = ServiceGrpc.newStub(channel);
+            final ClientStreamObserver streamObserver = new ClientStreamObserver();
+            StreamObserver<SubmitChunk> request = noBlockStub.submit(streamObserver);
 
             //Envio do programa (vindo do input do cliente) para o RunServer
-            request.onNext(SubmitChunk.newBuilder().setProgram(com.google.protobuf.ByteString.copyFrom(Files.readAllBytes(program))).build());
+            request.onNext(SubmitChunk.newBuilder().setProgram(ByteString.copyFrom(Files.readAllBytes(program))).build());
             log("submit sent program chunk bytes=" + Files.size(program)
                     + " to RunServer=" + address.getHost() + ":" + address.getPort());
-            if (input != null) request.onNext(SubmitChunk.newBuilder().setStdin(com.google.protobuf.ByteString.copyFrom(Files.readAllBytes(input))).build());
+            if (input != null) request.onNext(SubmitChunk.newBuilder().setStdin(ByteString.copyFrom(Files.readAllBytes(input))).build());
             if (input != null) log("submit sent stdin chunk bytes=" + Files.size(input));
             request.onCompleted();
-            if (!done.await(30, TimeUnit.SECONDS) || id[0] == null) {
-                throw new IllegalStateException("Submission failed", failure.get());
+            if (!streamObserver.getDone().await(30, TimeUnit.SECONDS) || streamObserver.getId() == null) {
+                throw new IllegalStateException("Submission failed", streamObserver.getFailure().get());
             }
-            log("submit response requestId=" + id[0]);
-            return id[0];
+            log("submit response requestId=" + streamObserver.getId());
+            return streamObserver.getId();
         } finally {
             channel.shutdownNow();
         }
@@ -72,7 +70,7 @@ public final class Client {
         log("locate response requestId=" + id + " RunServer=" + address.getHost() + ":" + address.getPort());
         ManagedChannel channel = channel(address);
         try {
-            Iterator<Result> results = RunnerGrpc.newBlockingStub(channel)
+            Iterator<Result> results = ServiceGrpc.newBlockingStub(channel)
                     .getResult(RequestId.newBuilder().setId(id).build());
             Result.Builder combined = Result.newBuilder().setId(id);
             ByteArrayOutputStream stdout = new ByteArrayOutputStream();
@@ -88,8 +86,8 @@ public final class Client {
                 stdout.writeBytes(result.getStdout().toByteArray());
                 stderr.writeBytes(result.getStderr().toByteArray());
             }
-            return combined.setStdout(com.google.protobuf.ByteString.copyFrom(stdout.toByteArray()))
-                    .setStderr(com.google.protobuf.ByteString.copyFrom(stderr.toByteArray()))
+            return combined.setStdout(ByteString.copyFrom(stdout.toByteArray()))
+                    .setStderr(ByteString.copyFrom(stderr.toByteArray()))
                     .build();
         } finally {
             channel.shutdownNow();
@@ -97,7 +95,7 @@ public final class Client {
     }
 
     private static ManagedChannel channel(ServerAddress address) {
-        return ManagedChannelBuilder.forAddress(address.getHost(), (int) address.getPort()).usePlaintext().build();
+        return ManagedChannelBuilder.forAddress(address.getHost(), address.getPort()).usePlaintext().build();
     }
 
     public void close() {
@@ -128,3 +126,65 @@ public final class Client {
         } finally { client.close(); }
     }
 }
+
+
+
+
+/* 
+Blocking Stub. A chamada bloqueia ate receber resposta
+
+
+private final ServerDirectoryGrpc.ServerDirectoryBlockingStub directory;
+directory = ServerDirectoryGrpc.newBlockingStub(managerChannel);
+
+Este stub é usado para falar com o ManagerServer.
+
+
+ServerAddress address =
+        directory.getServer(Empty.getDefaultInstance());
+
+corresponde ao contrato b do enunciado: obter o endereço de um RunServer.
+
+
+
+
+ServerAddress address =
+        directory.locate(RequestId.newBuilder()
+                .setId(id)
+                .build());
+
+Permite descobrir qual RunServer executou o pedido.
+
+
+Este é o contrato entre Client e RunServer.
+service Service {
+  rpc submit(stream SubmitChunk) returns (SubmitResponse);
+  rpc getResult(RequestId) returns (stream Result);
+}
+
+
+
+
+erviceGrpc.ServiceStub noBlockStub =
+        ServiceGrpc.newStub(channel);
+
+É um stub assíncrono/non-blocking.
+
+É usado porque submit recebe um stream de mensagens:
+StreamObserver<SubmitChunk> request =
+        noBlockStub.submit(responseObserver);
+
+
+    O cliente envia chunks:
+
+        request.onNext(...);
+        request.onCompleted();
+
+
+Iterator<Result> results =
+        ServiceGrpc.newBlockingStub(channel)
+                .getResult(request);
+
+
+É um blocking stub, usado para obter o resultado através de um stream de servidor.
+*/ 

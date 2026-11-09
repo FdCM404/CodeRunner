@@ -1,6 +1,21 @@
 package coderunner.runserver;
 
 import coderunner.proto.*;
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.CreateContainerCmd;
+import com.github.dockerjava.api.command.PullImageResultCallback;
+import com.github.dockerjava.api.command.WaitContainerResultCallback;
+import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.Bind;
+import com.github.dockerjava.api.model.HostConfig;
+import com.github.dockerjava.api.model.Mount;
+import com.github.dockerjava.api.model.MountType;
+import com.github.dockerjava.api.model.Volume;
+import com.github.dockerjava.core.DefaultDockerClientConfig;
+import com.github.dockerjava.core.DockerClientConfig;
+import com.github.dockerjava.core.DockerClientImpl;
+import com.github.dockerjava.httpclient5.ApacheDockerHttpClient;
+import com.google.protobuf.ByteString;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Server;
@@ -10,21 +25,30 @@ import redis.clients.jedis.JedisPooled;
 
 import java.io.IOException;
 import java.nio.file.*;
-import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 
 public final class RunServer {
+    
+    private static final String DOCKER_IMAGE = "python";
+    private static final String DOCKER_IMAGE_TAG = "3.12-slim";
+    private static final long DOCKER_MEMORY = 256L * 1024 * 1024;
+    private static final String DOCKER_COMMAND =
+            "timeout 10 python /work/program.py < /work/input.txt > /work/out.txt 2> /work/err.txt;"
+                    + " echo $? > /work/exit.txt";
     private static final String DEFAULT_MANAGER_HOST = "127.0.0.1";
     private static final int DEFAULT_MANAGER_PORT = 5000;
     private static final String DEFAULT_REDIS_HOST = "127.0.0.1";
     private static final int DEFAULT_REDIS_PORT = 6379;
-    static final String REDIS_KEY_PREFIX = "coderunner:request:";
+    private static final String WORK_VOLUME_ENV = "RUNSERVER_WORK_VOLUME";
+    private static final String REDIS_KEY_PREFIX = "coderunner:request:";
     private static final int MAX_PROGRAM_BYTES = 1_048_576;
     private static final int MAX_INPUT_BYTES = 1_048_576;
+
+
     private final String host;
     private final int port;
     private final String managerHost;
@@ -45,24 +69,31 @@ public final class RunServer {
                 + " ping=" + redis.ping() + " workRoot=" + workRoot.toAbsolutePath());
     }
 
-    private final class Service extends RunnerGrpc.RunnerImplBase {
-        @Override public StreamObserver<SubmitChunk> submit(StreamObserver<SubmitResponse> response) {
+    private final class Service extends ServiceGrpc.ServiceImplBase {
+        
+        @Override
+        public StreamObserver<SubmitChunk> submit(StreamObserver<SubmitResponse> response) {
             String id = UUID.randomUUID().toString();
             Path dir = workRoot.resolve(id);
             log("gRPC submit opened requestId=" + id + " workDir=" + dir.toAbsolutePath());
-            try { Files.createDirectories(dir); } catch (IOException e) {
+            try { 
+                Files.createDirectories(dir); 
+            } catch (IOException e) {
                 log("submit failed creating workDir requestId=" + id + " error=" + e.getMessage());
                 response.onError(io.grpc.Status.INTERNAL.withCause(e).asRuntimeException()); return cancelled();
             }
-            return new StreamObserver<>() {
+            return new StreamObserver<>() 
+            {
                 private final Path program = dir.resolve("program.py");
                 private final Path input = dir.resolve("input.txt");
                 private boolean receivedProgram;
                 private long programBytes;
                 private long inputBytes;
                 private boolean failed;
+                
 
-                @Override public void onNext(SubmitChunk chunk) {
+                @Override
+                public void onNext(SubmitChunk chunk) {
                     int chunkBytes = chunk.hasProgram() ? chunk.getProgram().size()
                             : chunk.hasStdin() ? chunk.getStdin().size() : 0;
                     log("submit chunk requestId=" + id + " type="
@@ -94,11 +125,13 @@ public final class RunServer {
                         fail(response, dir, "Unable to store uploaded data: " + e.getMessage());
                     }
                 }
-                @Override public void onError(Throwable t) {
+                @Override
+                public void onError(Throwable t) {
                     log("submit stream error requestId=" + id + " error=" + t.getMessage());
                     deleteTree(dir);
                 }
-                @Override public void onCompleted() {
+                @Override
+                public void onCompleted() {
                     log("submit stream completed requestId=" + id + " programBytes=" + programBytes
                             + " inputBytes=" + inputBytes);
                     if (failed || !receivedProgram) {
@@ -131,19 +164,25 @@ public final class RunServer {
             };
         }
 
-        @Override public void getResult(RequestId request, StreamObserver<Result> response) {
+        @Override
+        public void getResult(RequestId request, StreamObserver<Result> response)
+        {
             String key = REDIS_KEY_PREFIX + request.getId();
             log("gRPC getResult requestId=" + request.getId() + " Redis HGET key=" + key + " field=state");
+
             String state = redis.hget(key, "state");
             log("Redis HGET result key=" + key + " state=" + (state == null ? "<missing>" : state));
+
             if (state == null) { response.onError(io.grpc.Status.NOT_FOUND.asRuntimeException()); return; }
+
             Result.Builder result = Result.newBuilder().setId(request.getId()).setState(RequestState.valueOf(state));
             result.setOwnerHost(host).setOwnerPort(port);
+
             if ("FINISHED".equals(state) || "FAILED".equals(state) || "TIMEOUT".equals(state)) {
                 Path dir = workRoot.resolve(request.getId());
                 try {
-                    result.setStdout(com.google.protobuf.ByteString.copyFrom(readRequired(dir.resolve("out.txt"))))
-                            .setStderr(com.google.protobuf.ByteString.copyFrom(readRequired(dir.resolve("err.txt"))));
+                    Result.Builder builder = result.setStdout(ByteString.copyFrom(readRequired(dir.resolve("out.txt"))))
+                            .setStderr(ByteString.copyFrom(readRequired(dir.resolve("err.txt"))));
                     response.onNext(result.build());
                     response.onCompleted();
                     log("getResult completed requestId=" + request.getId()
@@ -165,34 +204,107 @@ public final class RunServer {
         String key = REDIS_KEY_PREFIX + id;
         log("execution started requestId=" + id + " Redis HSET key=" + key + " state=RUNNING");
         redis.hset(key, "state", "RUNNING");
+        String containerId = null;
+        DockerClientConfig config = DefaultDockerClientConfig.createDefaultConfigBuilder().build();
+        ApacheDockerHttpClient http = new ApacheDockerHttpClient.Builder()
+                .dockerHost(config.getDockerHost())
+                .sslConfig(config.getSSLConfig())
+                .build();
+        DockerClient docker = DockerClientImpl.getInstance(config, http);
         try {
-            String volume = dir.toAbsolutePath().toString().replace('\\', '/');
-            String uid = System.getenv().getOrDefault("RUNNER_UID", "1000");
-            String gid = System.getenv().getOrDefault("RUNNER_GID", uid);
-            Process process = new ProcessBuilder("docker", "run", "--rm", "--network", "none",
-                    "--memory", "256m", "--memory-swap", "256m", "--cpus", "0.5",
-                    "--user", uid + ":" + gid,
-                    "-v", volume + ":/work", "python:3.12-slim", "sh", "-c",
-                    "timeout 10 python /work/program.py < /work/input.txt > /work/out.txt 2> /work/err.txt; echo $? > /work/exit.txt")
-                    .redirectErrorStream(true).start();
-            log("docker started requestId=" + id + " containerImage=python:3.12-slim network=none memory=256m cpu=0.5");
-            boolean finished = process.waitFor(Duration.ofSeconds(15).toMillis(), TimeUnit.MILLISECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                Files.writeString(dir.resolve("err.txt"), "Execution timed out\n");
-                log("execution timeout requestId=" + id + " Redis HSET state=TIMEOUT");
-                redis.hset(key, "state", "TIMEOUT");
+            pullIfMissing(docker, DOCKER_IMAGE, DOCKER_IMAGE_TAG);
+            HostConfig hostConfig = HostConfig.newHostConfig()
+                    .withNetworkMode("none")
+                    .withMemory(DOCKER_MEMORY)
+                    .withMemorySwap(DOCKER_MEMORY);
+            String workPath = "/work";
+            String workVolume = System.getenv(WORK_VOLUME_ENV);
+            if (workVolume == null || workVolume.isBlank()) 
+            {
+                hostConfig.withBinds(new Bind(dir.toAbsolutePath().toString(), new Volume("/work")));
             } else {
-                int exitCode = Integer.parseInt(Files.readString(dir.resolve("exit.txt")).trim());
-                log("docker finished requestId=" + id + " exitCode=" + exitCode
-                        + " Redis HSET state=" + (exitCode == 0 ? "FINISHED" : exitCode == 124 ? "TIMEOUT" : "FAILED"));
-                redis.hset(key, "state", exitCode == 0 ? "FINISHED" : exitCode == 124 ? "TIMEOUT" : "FAILED");
+                hostConfig.withMounts(List.of(new Mount()
+                        .withType(MountType.VOLUME)
+                        .withSource(workVolume)
+                        .withTarget("/work")));
+                workPath += "/" + id;
             }
+            String dockerCommand = workPath.equals("/work")
+                    ? DOCKER_COMMAND
+                    : "timeout 10 python " + workPath + "/program.py < " + workPath
+                            + "/input.txt > " + workPath + "/out.txt 2> " + workPath
+                            + "/err.txt; echo $? > " + workPath + "/exit.txt";
+            CreateContainerCmd create = docker.createContainerCmd(DOCKER_IMAGE + ":" + DOCKER_IMAGE_TAG)
+                    .withName("run-" + id)
+                    .withHostConfig(hostConfig)
+                    .withCmd("sh", "-c", dockerCommand);
+            String user = currentUser();
+            if (user != null) create.withUser(user);
+            containerId = create.exec().getId();
+            docker.startContainerCmd(containerId).exec();
+            log("docker started requestId=" + id + " containerId=" + containerId
+                    + " containerImage=python:3.12-slim network=none memory=256m");
+            docker.waitContainerCmd(containerId)
+                    .exec(new WaitContainerResultCallback())
+                    .awaitStatusCode();
+            int exitCode = readExitCode(dir.resolve("exit.txt"));
+            String state = exitCode == 0 ? "FINISHED" : exitCode == 124 ? "TIMEOUT" : "FAILED";
+            log("docker finished requestId=" + id + " exitCode=" + exitCode + " Redis HSET state=" + state);
+            redis.hset(key, "state", state);
         } catch (Exception ex) {
-            try { Files.writeString(dir.resolve("err.txt"), ex.getMessage() == null ? ex.toString() : ex.getMessage()); }
-            catch (IOException writeError) { System.err.println("Unable to store execution error: " + writeError.getMessage()); }
+            try {
+                Files.writeString(dir.resolve("err.txt"),
+                        ex.getMessage() == null ? ex.toString() : ex.getMessage());
+            } catch (IOException writeError) {
+                log("unable to store execution error requestId=" + id + " error=" + writeError.getMessage());
+            }
             redis.hset(key, "state", "FAILED");
             log("execution failed requestId=" + id + " Redis HSET state=FAILED error=" + ex.getMessage());
+        } finally {
+            if (containerId != null) {
+                try {
+                    docker.removeContainerCmd(containerId).withForce(true).exec();
+                    log("docker removed requestId=" + id + " containerId=" + containerId);
+                } catch (NotFoundException ignored) {
+                    log("docker container already removed requestId=" + id + " containerId=" + containerId);
+                } catch (RuntimeException cleanupError) {
+                    log("unable to remove docker container requestId=" + id
+                            + " containerId=" + containerId + " error=" + cleanupError.getMessage());
+                }
+            }
+            try {
+                docker.close();
+            } catch (IOException closeError) {
+                log("unable to close docker client requestId=" + id
+                        + " error=" + closeError.getMessage());
+            }
+        }
+    }
+    
+    
+    
+    //TP1/.../ContainerRunner.java
+    private static int readExitCode(Path file) throws IOException {
+        return Files.exists(file) ? Integer.parseInt(Files.readString(file).trim()) : -1;
+    }
+
+    //TP1/.../ContainerRunner.java
+    private static String currentUser() {
+        if (System.getProperty("os.name").startsWith("Windows")) return null;
+        com.sun.security.auth.module.UnixSystem unix = new com.sun.security.auth.module.UnixSystem();
+        return unix.getUid() + ":" + unix.getGid();
+    }
+
+    //TP1/.../ContainerRunner.java
+    private static void pullIfMissing(DockerClient docker, String image, String tag)
+            throws InterruptedException {
+        try {
+            docker.inspectImageCmd(image + ":" + tag).exec();
+        } catch (NotFoundException e) {
+            System.out.println("Pulling " + image + ":" + tag + " ...");
+            docker.pullImageCmd(image).withTag(tag)
+                    .exec(new PullImageResultCallback())
+                    .awaitCompletion();
         }
     }
 
@@ -209,7 +321,13 @@ public final class RunServer {
             System.err.println("Unable to clean request directory " + root + ": " + e.getMessage());
         }
     }
-    private static StreamObserver<SubmitChunk> cancelled() { return new StreamObserver<>() { public void onNext(SubmitChunk ignored) {} public void onError(Throwable ignored) {} public void onCompleted() {} }; }
+    private static StreamObserver<SubmitChunk> cancelled() {
+        return new StreamObserver<>() {
+            public void onNext(SubmitChunk ignored) {}
+            public void onError(Throwable ignored) {}
+            public void onCompleted() {}
+        };
+    }
 
     public void start() throws Exception {
         ManagedChannel channel = ManagedChannelBuilder.forAddress(managerHost, managerPort).usePlaintext().build();
@@ -218,7 +336,7 @@ public final class RunServer {
                     ManagerRegistrationGrpc.newBlockingStub(channel);
             RegisterResponse registered = manager.register(RegisterRequest.newBuilder().setHost(host).setPort(port).build());
             redis.close();
-            redis = new JedisPooled(registered.getRedisHost(), (int) registered.getRedisPort());
+            redis = new JedisPooled(registered.getRedisHost(), registered.getRedisPort());
             log("registered with ManagerServer=" + managerHost + ":" + managerPort
                     + " Redis=" + registered.getRedisHost() + ":" + registered.getRedisPort());
         } finally {
@@ -239,3 +357,18 @@ public final class RunServer {
         new RunServer(args[0], Integer.parseInt(args[1]), managerHost, managerPort, redisHost, redisPort, Paths.get("requests")).start();
     }
 }
+
+
+
+/* 
+Blocking Stub. A chamada bloqueia ate receber resposta
+
+RegisterResponse registered =
+        manager.register(RegisterRequest.newBuilder()
+                .setHost(host)
+                .setPort(port)
+                .build());
+
+É usado para o RunServer se registar no ManagerServer e receber o endereço do Redis.
+
+*/ 

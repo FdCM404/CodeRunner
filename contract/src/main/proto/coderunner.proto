@@ -9,14 +9,29 @@ service ManagerRegistration {
   rpc register(RegisterRequest) returns (RegisterResponse); // a - Registo
 }
 
-//RunServers
+
 service ServerDirectory {
-  rpc getServer(Empty) returns (ServerAddress);
+  rpc getServer(Empty) returns (ServerAddress);   // b - Obter Servidor
   rpc locate(RequestId) returns (ServerAddress);
 }
 
-//Cliente
-service Runner {
+
+
+// c - Execucao, implementado no RunServer
+//    submit
+// recebe SubmitChunk por streaming, guarda o programa e o input na pasta do UUID
+// regista PENDING no redis
+// devolve o id, inicia a execuçao em bg
+
+//    getResult
+// recebe o id
+// consulta o estado no redis
+// devolve estados
+// le out.txt, err.txt
+// envia a resposta por streaming e remove files e chave redis apos a leitura
+
+//runserver (contrato entre cliente e runserver)
+service Service {
   rpc submit(stream SubmitChunk) returns (SubmitResponse);
   rpc getResult(RequestId) returns (stream Result);
 }

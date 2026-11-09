@@ -13,8 +13,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public final class ManagerServer {
 
-    public static final String DEFAULT_HOST = "127.0.0.1";
     public static final int DEFAULT_PORT = 5000;
+
     public static final String REDIS_HOST = System.getenv().getOrDefault("REDIS_HOST", "127.0.0.1");
     public static final String REDIS_ADVERTISE_HOST =
             System.getenv().getOrDefault("REDIS_ADVERTISE_HOST", REDIS_HOST);
@@ -27,7 +27,8 @@ public final class ManagerServer {
     static final class Registry {
         private final List<ServerAddress> runners = new ArrayList<>();
         private final AtomicInteger next = new AtomicInteger();
-
+        
+        //a - Registo
         synchronized void register(ServerAddress address) {
             runners.removeIf(a -> a.getHost().equals(address.getHost()) && a.getPort() == address.getPort());
             runners.add(address);
@@ -37,6 +38,7 @@ public final class ManagerServer {
 
         synchronized ServerAddress next() {
             if (runners.isEmpty()) throw new IllegalStateException("No RunServer is registered");
+            // Round Robin for server picking
             ServerAddress selected = runners.get(Math.floorMod(next.getAndIncrement(), runners.size()));
             log("registry.next selected=" + selected.getHost() + ":" + selected.getPort()
                     + " registeredRunners=" + runners.size());
@@ -51,8 +53,10 @@ public final class ManagerServer {
         RegistrationService(Registry registry) {
             this.registry = registry;
         }
-
-        @Override public void register(RegisterRequest request, StreamObserver<RegisterResponse> response) {
+        
+        // interaçao ManagerServer <-> RunServer
+        @Override
+        public void register(RegisterRequest request, StreamObserver<RegisterResponse> response) {
             log("gRPC register request from RunServer=" + request.getHost() + ":" + request.getPort()
                     + " -> Redis=" + REDIS_HOST + ":" + REDIS_PORT
                     + " advertisedRedis=" + REDIS_ADVERTISE_HOST + ":" + REDIS_PORT);
@@ -66,6 +70,7 @@ public final class ManagerServer {
     }
 
     static final class DirectoryService extends ServerDirectoryGrpc.ServerDirectoryImplBase {
+        
         private final Registry registry;
         private final JedisPooled redis;
 
@@ -76,9 +81,12 @@ public final class ManagerServer {
                     + " ping=" + redis.ping());
         }
 
-        @Override public void getServer(Empty request, StreamObserver<ServerAddress> response) {
+        // interaçao Cliente <-> mngServer
+        @Override
+        public void getServer(Empty request, StreamObserver<ServerAddress> response) {
             log("gRPC getServer request");
             try {
+                // b - Obter Servidor
                 ServerAddress selected = registry.next();
                 response.onNext(selected);
                 response.onCompleted();
@@ -88,16 +96,25 @@ public final class ManagerServer {
                 response.onError(io.grpc.Status.UNAVAILABLE.withDescription(ex.getMessage()).asRuntimeException());
             }
         }
+/*
+Permitir descobrir qual o RunServer específico que processou um determinado id de pedido, 
+disponibilizando o requisito de que o cliente pode consultar resultados mesmo estando ligado a outro servidor.
+ */
+        @Override
+        public void locate(RequestId request, StreamObserver<ServerAddress> response) {
 
-        @Override public void locate(RequestId request, StreamObserver<ServerAddress> response) {
             String key = "coderunner:request:" + request.getId();
+
             log("Redis HGET key=" + key + " field=owner");
+
             String value = redis.hget(key, "owner");
             if (value == null) {
                 log("Redis HGET result key=" + key + " owner=<missing>");
                 response.onError(io.grpc.Status.NOT_FOUND.asRuntimeException());
                 return;
             }
+
+            //parsing
             log("Redis HGET result key=" + key + " owner=" + value);
             String[] parts = value.split(":", 2);
             if (parts.length != 2) {
